@@ -1,0 +1,27 @@
+@app.put("/update/{id}")
+def update_book(id: int, update: updateBook) -> updateResponse:
+    if id not in all_books:
+        raise HTTPException(status_code=404, detail="Book not found")
+    
+    # Update only the status field, preserving other book data
+    all_books[id]["status"] = update.status
+    
+    # Create the response
+    response = updateResponse(
+        message=f"Book {id} updated successfully",
+        book=all_books[id]
+    )
+    return response
+
+
+
+    @app.get("/books")
+def get_all_books():
+    return all_books
+
+@app.get("/books/{id}")
+def get_all_books(id: int):
+    if id not in all_books:
+        raise HTTPException(status_code=404, detail="Book not found")
+    
+    return all_books.get(id)
