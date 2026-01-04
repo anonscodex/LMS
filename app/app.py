@@ -458,7 +458,7 @@ async def login(
         full_name=user.full_name,
         student_id=user.student_id,
         is_admin=user.is_admin,
-        max_books_allowed=getattr(user, 'max_books_allowed', 99),  # Default to 5 if not exists
+        max_books_allowed=getattr(user, 'max_books_allowed', 50),  # Default to 5 if not exists
         access_token=access_token,
         token_type="bearer"
     )
