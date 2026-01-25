@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends, File, Form, UploadFile, status
-from app.schemas import uploadBook, uploadResponse, updateBook, updateResponse, UserRegister, UserResponse, UserProfileResponse, AdminRegisterRequest, AdminRegisterResponse
-from app.db import Book, User, create_db_and_tables, get_async_session 
+from app.schemas import uploadBook, uploadResponse, updateBook, updateResponse, UserRegister, UserResponse, UserProfileResponse, AdminRegisterRequest, AdminRegisterResponse, BorrowRequest, BorrowResponse
+from app.db import Book, User, BorrowRecord, create_db_and_tables, get_async_session 
 from sqlalchemy.ext.asyncio import AsyncSession
 from contextlib import asynccontextmanager
 from sqlalchemy import select
@@ -84,6 +84,18 @@ async def get_current_active_user(current_user: User = Depends(get_current_user)
     if not current_user.is_active:
         raise HTTPException(status_code=400, detail="Inactive user")
     return current_user
+
+
+async def get_current_admin_user(current_user: User = Depends(get_current_active_user)):
+    """Check if current user is admin"""
+    if not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required. Only administrators can perform this action."
+        )
+    return current_user
+
+
 
 # ========== PUBLIC ENDPOINTS ==========
 
@@ -191,24 +203,49 @@ async def register_user(
         "created_at": user.created_at.isoformat() if user.created_at else None
     }
 
-@app.post("/upload", response_model=uploadResponse)
+
+@app.post("/upload", response_model=uploadResponse)  # Your response model
 async def upload_book(
+    # Current user must be admin
+    current_user: User = Depends(get_current_admin_user),
+    
+    # File upload
     file: UploadFile = File(...),
+    
+    # Book details
     title: str = Form(...),
     description: str = Form(...),
-    isbn: str = Form(...),
     author: str = Form(...),
-    publisher: str = Form(...),
-    publication_year: str = Form(...),
-    category: str = Form(...),
-    total_copies: str = Form(...),
-    available_copies: str = Form(...),
+    isbn: str = Form(default=""),
+    publisher: str = Form(default=None),
+    publication_year: int = Form(default=None),  # Change to int
+    category: str = Form(default=None),
+    total_copies: int = Form(default=1),  # Change to int
     status: str = Form(default="available"),
+    
+    # Database session
     session: AsyncSession = Depends(get_async_session)
 ): 
+    """Upload a new book (Admin only)"""
+    
+    # Log who is uploading
+    print(f"Admin {current_user.username} is uploading a book: {title}")
+    
     temp_file_path = None
 
     try:
+        # Check if book with same ISBN already exists
+        if isbn:
+            existing_book = await session.execute(
+                select(Book).where(Book.isbn == isbn)
+            )
+            if existing_book.scalar_one_or_none():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Book with ISBN {isbn} already exists"
+                )
+        
+        # Handle file upload to ImageKit
         file_extension = os.path.splitext(file.filename)[1]
         
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
@@ -220,60 +257,37 @@ async def upload_book(
         upload_result = imagekit.files.upload(
             file=open(temp_file_path, "rb"),
             file_name=file.filename,
-            use_unique_file_name=True, 
-            tags=["backend-upload"]
+            use_unique_file_name=True,
+            tags=["library-upload", f"uploaded-by-{current_user.username}"]
         )
 
-        # Debug: Check what attributes the response has
-        print("Upload result type:", type(upload_result))
-        print("Upload result attributes:", dir(upload_result))
-        
-        # Check if upload was successful
-        if hasattr(upload_result, 'error'):
-            if upload_result.error:
-                raise HTTPException(status_code=500, detail=f"ImageKit error: {upload_result.error}")
-        
-        # Check for status code or successful response
-        if hasattr(upload_result, 'status_code'):
-            if upload_result.status_code == 200:
-                # Success - create book
-                pass
-        elif hasattr(upload_result, 'response_metadata'):
-            # Check response_metadata attribute
-            if upload_result.response_metadata.http_status_code == 200:
-                # Success - create book
-                pass
-        elif hasattr(upload_result, 'url'):
-            # If there's a URL, assume success
-            # Success - create book
-            pass
-        else:
-            # Couldn't determine success
-            raise HTTPException(status_code=500, detail="Unknown upload response format")
+        if not hasattr(upload_result, 'url') or not upload_result.url:
+            raise HTTPException(status_code=500, detail="Image upload failed")
 
         # Generate UUID for the book
         book_id = str(uuid.uuid4())
         
-        # Get the URL from the response
-        image_url = getattr(upload_result, 'url', 'https://example.com/default.jpg')
-        
+        # Create book
         book = Book(
             id=book_id,
-            url=image_url,
+            url=upload_result.url,
             title=title,
             description=description,
             author=author,
-            isbn=isbn,
+            isbn=isbn if isbn else None,
             publisher=publisher,
             publication_year=publication_year,
             category=category,
             total_copies=total_copies,
-            available_copies=available_copies,
-            status=status
-        ) 
+            available_copies=total_copies,  # All copies available initially
+            status=status,
+            
+        )
+        
         session.add(book)
         await session.commit()
         await session.refresh(book)
+        
         return book
 
     except Exception as e:
@@ -282,6 +296,74 @@ async def upload_book(
         if temp_file_path and os.path.exists(temp_file_path):
             os.unlink(temp_file_path)
         await file.close()
+
+
+# ========== AUTH DEPENDENCIES ==========
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """Get current user from JWT token"""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    
+    result = await session.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    
+    if user is None:
+        raise credentials_exception
+    
+    return user
+
+async def get_current_active_user(current_user: User = Depends(get_current_user)):
+    """Get current active user"""
+    if not current_user.is_active:
+        raise HTTPException(status_code=400, detail="Inactive user")
+    return current_user
+
+async def get_current_admin_user(current_user: User = Depends(get_current_active_user)):
+    """Check if current user is admin"""
+    if not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required. Only administrators can perform this action."
+        )
+    return current_user
+
+# ========== PROTECTED ENDPOINTS delete ==========
+
+
+@app.delete("/books/{book_id}")
+async def delete_book(
+    book_id: str,
+    current_user: User = Depends(get_current_admin_user),  # Admin only
+    session: AsyncSession = Depends(get_async_session)
+):
+    """Delete a book (Admin only)"""
+    result = await session.execute(
+        select(Book).where(Book.id == book_id)
+    )
+    book = result.scalar_one_or_none()
+    
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    
+    await session.delete(book)
+    await session.commit()
+    
+    return {"message": f"Book '{book.title}' deleted successfully"}
 
 @app.get("/allusers")
 async def get_all_users(
@@ -357,11 +439,12 @@ async def get_book_by_id(
 
 @app.patch("/books/{book_id}", response_model=updateResponse)
 async def update_book_by_id(
-    book_id: str,  
-    book_data: updateBook,  
+    book_id: str,
+    book_data: updateBook,  # This should be defined in schemas.py, not here
+    current_user: User = Depends(get_current_admin_user),  # Admin only
     session: AsyncSession = Depends(get_async_session)
 ):
-    # fetch the existing book
+    # Fetch the existing book
     result = await session.execute(
         select(Book).where(Book.id == book_id)
     )
@@ -370,30 +453,18 @@ async def update_book_by_id(
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
     
-    
+    # Update only the fields that are provided in the request
     update_dict = book_data.dict(exclude_unset=True)
     for key, value in update_dict.items():
-        setattr(book, key, value)
+        if value is not None:  # Don't update with None values
+            setattr(book, key, value)
     
     await session.commit()
     await session.refresh(book)
     
     return {
         "message": "Book updated successfully",
-        "book": {
-            "id": str(book.id),
-            "url": book.url if book.url else None,
-                "title": book.title,
-                "description": book.description,
-                "author": book.author,
-                "isbn":book.isbn,
-                "publisher":book.publisher,
-                "publication_year":book.publication_year,
-                "category":book.category,
-                "total_copies":book.total_copies,
-                "available_copies":book.available_copies,
-                "status": book.status
-        }
+        "book": book  # Let FastAPI convert using updateResponse model
     }
 
 
@@ -475,36 +546,114 @@ async def get_my_borrowed_books(
     current_user: User = Depends(get_current_active_user),
     session: AsyncSession = Depends(get_async_session)
 ):
-    """Get books borrowed by current user"""
-    from app.db import BorrowRecord, Book
-    from sqlalchemy.orm import selectinload
+    """Get current user's borrowed books - NO relationships"""
     
+    # Get borrow records for this user
     result = await session.execute(
-        select(BorrowRecord)
-        .options(selectinload(BorrowRecord.book))
-        .where(
+        select(BorrowRecord).where(
             BorrowRecord.user_id == current_user.id,
             BorrowRecord.status == "borrowed"
-        )
-        .order_by(BorrowRecord.due_date)
+        ).order_by(BorrowRecord.due_date)
     )
     
-    borrowed_records = result.scalars().all()
+    borrow_records = result.scalars().all()
     
-    books = []
-    for record in borrowed_records:
-        books.append({
-            "book_id": record.book.id,
-            "title": record.book.title,
-            "author": record.book.author,
-            "borrowed_date": record.borrowed_date,
-            "due_date": record.due_date,
-            "renewal_count": record.renewal_count
-        })
+    # Get book details for each borrow record
+    borrowed_books = []
+    for record in borrow_records:
+        # Get the book
+        book_result = await session.execute(
+            select(Book).where(Book.id == record.book_id)
+        )
+        book = book_result.scalar_one_or_none()
+        
+        if book:
+            borrowed_books.append({
+                "borrow_id": record.id,
+                "book_id": book.id,
+                "title": book.title,
+                "author": book.author,
+                "borrowed_date": record.borrowed_date,
+                "due_date": record.due_date,
+                "days_remaining": (record.due_date - datetime.utcnow()).days,
+                "renewal_count": record.renewal_count,
+                "max_renewals": record.max_renewals
+            })
     
     return {
         "user_id": current_user.id,
         "username": current_user.username,
-        "borrowed_books_count": len(books),
-        "borrowed_books": books
+        "borrowed_books": borrowed_books,
+        "count": len(borrowed_books)
+    }
+
+
+@app.post("/books/{book_id}/borrow")
+async def borrow_book(
+    book_id: str,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """Borrow a book - NO relationship version"""
+    
+    # 1. Check user borrowing limit
+    if current_user.current_books_borrowed >= current_user.max_books_allowed:
+        raise HTTPException(status_code=400, detail="Borrowing limit reached")
+    
+    # 2. Get book
+    result = await session.execute(select(Book).where(Book.id == book_id))
+    book = result.scalar_one_or_none()
+    
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    
+    if book.available_copies < 1:
+        raise HTTPException(status_code=400, detail="No copies available")
+    
+    # 3. Check if user already borrowed this book
+    existing_borrow = await session.execute(
+        select(BorrowRecord).where(
+            BorrowRecord.user_id == current_user.id,
+            BorrowRecord.book_id == book_id,
+            BorrowRecord.status == "borrowed"
+        )
+    )
+    
+    if existing_borrow.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Already borrowed this book")
+    
+    # 4. Create borrow record
+    from datetime import timedelta
+    borrowed_date = datetime.utcnow()
+    due_date = borrowed_date + timedelta(days=14)
+    
+    borrow_record = BorrowRecord(
+        user_id=current_user.id,
+        book_id=book_id,
+        borrowed_date=borrowed_date,
+        due_date=due_date,
+        status="borrowed"
+    )
+    
+    # 5. Update book availability
+    book.available_copies -= 1
+    if book.available_copies == 0:
+        book.status = "borrowed"
+    
+    # 6. Update user's borrowed count
+    current_user.current_books_borrowed += 1
+    
+    # 7. Save everything
+    session.add(borrow_record)
+    await session.commit()
+    
+    # 8. Return success
+    return {
+        "message": f"Successfully borrowed '{book.title}'",
+        "borrow_id": borrow_record.id,
+        "book_title": book.title,
+        "borrowed_date": borrow_record.borrowed_date,
+        "due_date": borrow_record.due_date,
+        "user_books_borrowed": current_user.current_books_borrowed,
+        "book_available_copies": book.available_copies
     }

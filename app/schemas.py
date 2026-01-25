@@ -35,25 +35,50 @@ class uploadBook(BaseModel):
     status: str
 
 class uploadResponse(BaseModel):
-    id: str  # Make sure this is included
-    url: str  # Add this field
+    id: str
+    url: Optional[str] = None  # Make optional and nullable
     title: str
     description: str
     author: str
-    isbn: str
-    publisher: str
-    publication_year: str
-    category: str
-    total_copies: str
-    available_copies: str
-    status: str  # "available", "borrowed", "reserved", etc.
+    isbn: Optional[str] = None  # Make optional
+    publisher: Optional[str] = None  # Make optional
+    publication_year: Optional[int] = None  # Should be int, not str
+    category: Optional[str] = None  # Make optional
+    total_copies: int  # Should be int, not str
+    available_copies: int  # Should be int, not str
+    status: str
+
 
 class updateBook(BaseModel):
-    status: str
+    total_copies: Optional[int] = None
+    available_copies: Optional[int] = None
+    status: Optional[str] = None
+    
+    @field_validator('status')
+    @classmethod
+    def validate_status(cls, v: Optional[str]) -> Optional[str]:
+        if v and v not in ["available", "borrowed", "reserved", "maintenance", "lost"]:
+            raise ValueError('Status must be: available, borrowed, reserved, maintenance, or lost')
+        return v
+    
+    @field_validator('available_copies')
+    @classmethod
+    def validate_available_copies(cls, v: Optional[int], info) -> Optional[int]:
+        if v is not None and v < 0:
+            raise ValueError('Available copies cannot be negative')
+        
+        # Check if available_copies exceeds total_copies
+        if 'total_copies' in info.data and info.data['total_copies'] is not None:
+            if v > info.data['total_copies']:
+                raise ValueError('Available copies cannot exceed total copies')
+        
+        return v
 
 class updateResponse(BaseModel):
     message: str
-    book: dict
+    book: uploadResponse  # Reuse your existing uploadResponse model
+    
+    model_config = ConfigDict(from_attributes=True)
 
 
 
@@ -161,5 +186,43 @@ class UserProfileResponse(BaseModel):
     current_books_borrowed: Optional[int] = 0
     total_books_borrowed: Optional[int] = 0
     created_at: Optional[datetime] = None
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+class BorrowRequest(BaseModel):
+    book_id: str
+    borrow_days: Optional[int] = 14  # Default 2 weeks
+    
+    @field_validator('borrow_days')
+    @classmethod
+    def validate_borrow_days(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError('Borrow days must be at least 1')
+        if v > 90:  # Maximum 3 months
+            raise ValueError('Borrow days cannot exceed 90 days')
+        return v
+
+class BorrowResponse(BaseModel):
+    message: str
+    borrow_id: str
+    book_title: str
+    borrowed_date: datetime
+    due_date: datetime
+    renewal_count: int
+    status: str
+    
+    model_config = ConfigDict(from_attributes=True)
+
+class ReturnRequest(BaseModel):
+    borrow_id: str
+
+class ReturnResponse(BaseModel):
+    message: str
+    borrow_id: str
+    book_title: str
+    borrowed_date: datetime
+    returned_date: datetime
+    status: str
     
     model_config = ConfigDict(from_attributes=True)
