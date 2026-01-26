@@ -91,9 +91,20 @@ class BorrowRecord(Base):
     due_date: Mapped[datetime] = mapped_column(DateTime)
     returned_date: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     
-    status: Mapped[str] = mapped_column(String, default="borrowed")  # borrowed, returned, overdue
+    
     renewal_count: Mapped[int] = mapped_column(Integer, default=0)
     max_renewals: Mapped[int] = mapped_column(Integer, default=2)
+    status = Column(String, default="pending_approval")  # Change default
+    borrowed_date = Column(DateTime, default=datetime.utcnow)
+    due_date = Column(DateTime, nullable=True)  # Make nullable initially
+    approved_by = Column(String, nullable=True)  # Who approved/rejected
+    approval_notes = Column(Text, nullable=True)  # Notes from admin
+    approval_date = Column(DateTime, nullable=True)  # When approved/rejected
+    
+    # Add these missing columns:
+    return_requested_date = Column(DateTime, nullable=True)
+    return_approved_by = Column(String, nullable=True)
+    return_notes = Column(Text, nullable=True)
     
     user: Mapped["User"] = relationship("User", back_populates="borrow_records")
     book: Mapped["Book"] = relationship("Book", back_populates="borrow_records")

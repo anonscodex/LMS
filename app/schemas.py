@@ -1,6 +1,7 @@
 from pydantic import BaseModel, EmailStr, field_validator, ConfigDict
 from typing import Optional
 from datetime import datetime
+from enum import Enum
 
 
 
@@ -208,21 +209,79 @@ class BorrowResponse(BaseModel):
     borrow_id: str
     book_title: str
     borrowed_date: datetime
-    due_date: datetime
+    due_date: Optional[datetime] = None 
     renewal_count: int
     status: str
     
     model_config = ConfigDict(from_attributes=True)
 
 class ReturnRequest(BaseModel):
+    """Request model for returning a book"""
     borrow_id: str
 
 class ReturnResponse(BaseModel):
+    """Response model for returning a book"""
     message: str
     borrow_id: str
     book_title: str
+    book_id: str
+    user_id: str
     borrowed_date: datetime
-    returned_date: datetime
-    status: str
+    returned_date: Optional[datetime] = None 
+    user_books_borrowed: int
+    book_available_copies: int
     
     model_config = ConfigDict(from_attributes=True)
+
+class ReturnStatus(str, Enum):
+    PENDING = "pending_return"
+    APPROVED = "returned"
+    BORROWED = "borrowed"
+
+
+class AdminApproveReturn(BaseModel):
+    """Admin approve return request"""
+    borrow_id: str
+    approve: bool = True
+    notes: Optional[str] = None
+
+class PendingReturnResponse(BaseModel):
+    """Response for pending returns"""
+    borrow_id: str
+    book_id: str
+    book_title: str
+    author: str
+    user_id: str
+    username: str
+    email: str
+    borrowed_date: datetime
+    due_date: datetime
+    return_requested_date: datetime
+    days_pending: int
+    days_borrowed: int
+    renewal_count: int
+
+class UserPendingReturn(BaseModel):
+    """User's pending returns"""
+    borrow_id: str
+    book_id: str
+    book_title: str
+    author: str
+    borrowed_date: datetime
+    return_requested_date: datetime
+    days_pending: int
+    status: str
+    instructions: str
+
+class BorrowStatus(str, Enum):
+    PENDING = "pending_approval"
+    APPROVED = "borrowed"
+    REJECTED = "rejected"
+    RETURNED = "returned"
+
+class AdminApproveBorrow(BaseModel):
+    """Admin approve/reject borrow request"""
+    borrow_id: str
+    approve: bool = True
+    notes: Optional[str] = None
+    due_date_days: Optional[int] = 14  # Default 14 days

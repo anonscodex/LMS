@@ -1,9 +1,9 @@
 from fastapi import FastAPI, HTTPException, Depends, File, Form, UploadFile, status
-from app.schemas import uploadBook, uploadResponse, updateBook, updateResponse, UserRegister, UserResponse, UserProfileResponse, AdminRegisterRequest, AdminRegisterResponse, BorrowRequest, BorrowResponse
+from app.schemas import uploadBook, uploadResponse, updateBook, updateResponse, UserRegister, UserResponse, UserProfileResponse, AdminRegisterRequest, AdminRegisterResponse, BorrowRequest, BorrowResponse, ReturnResponse, AdminApproveReturn, AdminApproveBorrow, BorrowStatus
 from app.db import Book, User, BorrowRecord, create_db_and_tables, get_async_session 
 from sqlalchemy.ext.asyncio import AsyncSession
 from contextlib import asynccontextmanager
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 import uuid
 from passlib.context import CryptContext
@@ -588,17 +588,29 @@ async def get_my_borrowed_books(
     }
 
 
-@app.post("/books/{book_id}/borrow")
-async def borrow_book(
+@app.post("/books/{book_id}/borrow", response_model=BorrowResponse)
+async def request_borrow_book(
     book_id: str,
     current_user: User = Depends(get_current_active_user),
     session: AsyncSession = Depends(get_async_session)
 ):
-    """Borrow a book - NO relationship version"""
+    """Request to borrow a book (creates pending approval request)"""
     
-    # 1. Check user borrowing limit
-    if current_user.current_books_borrowed >= current_user.max_books_allowed:
-        raise HTTPException(status_code=400, detail="Borrowing limit reached")
+    # 1. Check user borrowing limit (including pending requests)
+    # Count both borrowed and pending books
+    borrow_count_result = await session.execute(
+        select(func.count(BorrowRecord.id)).where(
+            BorrowRecord.user_id == current_user.id,
+            BorrowRecord.status.in_(["borrowed", "pending_approval"])
+        )
+    )
+    total_borrow_count = borrow_count_result.scalar()
+    
+    if total_borrow_count >= current_user.max_books_allowed:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Borrowing limit reached. You have {total_borrow_count} books (including pending requests)"
+        )
     
     # 2. Get book
     result = await session.execute(select(Book).where(Book.id == book_id))
@@ -607,53 +619,778 @@ async def borrow_book(
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
     
+    # Check available copies
     if book.available_copies < 1:
         raise HTTPException(status_code=400, detail="No copies available")
     
-    # 3. Check if user already borrowed this book
+    # 3. Check if user already has a pending or active borrow for this book
     existing_borrow = await session.execute(
         select(BorrowRecord).where(
             BorrowRecord.user_id == current_user.id,
             BorrowRecord.book_id == book_id,
-            BorrowRecord.status == "borrowed"
+            BorrowRecord.status.in_(["borrowed", "pending_approval"])
         )
     )
     
     if existing_borrow.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="Already borrowed this book")
+        raise HTTPException(
+            status_code=400, 
+            detail="Already borrowed or pending approval for this book"
+        )
     
-    # 4. Create borrow record
-    from datetime import timedelta
-    borrowed_date = datetime.utcnow()
-    due_date = borrowed_date + timedelta(days=14)
-    
+    # 4. Create PENDING borrow record (NOT approved yet)
     borrow_record = BorrowRecord(
         user_id=current_user.id,
         book_id=book_id,
-        borrowed_date=borrowed_date,
-        due_date=due_date,
-        status="borrowed"
+        status="pending_approval"  # Important: Not "borrowed" yet
+        # due_date will be set when admin approves
+        # book copies NOT reduced yet
+        # user count NOT increased yet
     )
     
-    # 5. Update book availability
-    book.available_copies -= 1
-    if book.available_copies == 0:
-        book.status = "borrowed"
-    
-    # 6. Update user's borrowed count
-    current_user.current_books_borrowed += 1
-    
-    # 7. Save everything
     session.add(borrow_record)
     await session.commit()
     
-    # 8. Return success
+    # 5. Log the request (optional)
+    print(f"Borrow request created: User {current_user.username} requested book '{book.title}'")
+    
+    return BorrowResponse(
+        message=f"Borrow request submitted for '{book.title}'. Awaiting admin approval.",
+        borrow_id=borrow_record.id,
+        book_title=book.title,
+        borrowed_date=borrow_record.borrowed_date,
+        due_date=None,  # Not set until approved
+        renewal_count=0,
+        status=BorrowStatus.PENDING
+    )
+
+@app.post("/admin/borrows/approve", response_model=BorrowResponse)
+async def admin_approve_borrow(
+    approve_data: AdminApproveBorrow,
+    current_user: User = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """Admin approves or rejects a borrow request"""
+    
+    # 1. Find the pending borrow record
+    result = await session.execute(
+        select(BorrowRecord).where(
+            BorrowRecord.id == approve_data.borrow_id,
+            BorrowRecord.status == "pending_approval"
+        )
+    )
+    
+    borrow_record = result.scalar_one_or_none()
+    
+    if not borrow_record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pending borrow request not found"
+        )
+    
+    # 2. Get the book
+    book_result = await session.execute(
+        select(Book).where(Book.id == borrow_record.book_id)
+    )
+    book = book_result.scalar_one_or_none()
+    
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    
+    # 3. Get the user who requested
+    user_result = await session.execute(
+        select(User).where(User.id == borrow_record.user_id)
+    )
+    user = user_result.scalar_one_or_none()
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    approval_date = datetime.utcnow()
+    
+    if approve_data.approve:
+        # Check if book is still available
+        if book.available_copies < 1:
+            # Reject if no copies available
+            borrow_record.status = "rejected"
+            borrow_record.approval_notes = f"Rejected: No copies available when reviewing"
+            borrow_record.approved_by = current_user.id
+            borrow_record.approval_date = approval_date
+            
+            message = f"Request rejected: No copies of '{book.title}' available"
+            status_str = BorrowStatus.REJECTED
+        else:
+            # APPROVE the request
+            from datetime import timedelta
+            
+            # Set due date (default 14 days or custom)
+            due_days = approve_data.due_date_days or 14
+            due_date = approval_date + timedelta(days=due_days)
+            
+            borrow_record.status = "borrowed"
+            borrow_record.due_date = due_date
+            borrow_record.approved_by = current_user.id
+            borrow_record.approval_notes = approve_data.notes
+            borrow_record.approval_date = approval_date
+            
+            # Update book availability
+            book.available_copies -= 1
+            if book.available_copies == 0:
+                book.status = "borrowed"
+            
+            # Update user's borrowed count
+            user.current_books_borrowed += 1
+            
+            message = f"Borrow request approved for '{book.title}'. Due date: {due_date.strftime('%Y-%m-%d')}"
+            status_str = BorrowStatus.APPROVED
+            
+            # Send notification (optional)
+            print(f"Borrow approved: User {user.username} can collect '{book.title}'")
+    else:
+        # REJECT the request
+        borrow_record.status = "rejected"
+        borrow_record.approved_by = current_user.id
+        borrow_record.approval_notes = approve_data.notes or "Rejected by admin"
+        borrow_record.approval_date = approval_date
+        
+        message = f"Borrow request rejected for '{book.title}'"
+        status_str = BorrowStatus.REJECTED
+    
+    # 4. Save changes
+    await session.commit()
+    
+    return BorrowResponse(
+        message=message,
+        borrow_id=borrow_record.id,
+        book_title=book.title,
+        borrowed_date=borrow_record.borrowed_date,
+        due_date=borrow_record.due_date,
+        renewal_count=borrow_record.renewal_count,
+        status=status_str
+    )
+
+@app.get("/admin/borrows/pending")
+async def get_pending_borrows(
+    current_user: User = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """Get all pending borrow requests (Admin only)"""
+    
+    result = await session.execute(
+        select(BorrowRecord).where(
+            BorrowRecord.status == "pending_approval"
+        ).order_by(BorrowRecord.borrowed_date)
+    )
+    
+    pending_records = result.scalars().all()
+    
+    pending_borrows = []
+    for record in pending_records:
+        # Get book details
+        book_result = await session.execute(
+            select(Book).where(Book.id == record.book_id)
+        )
+        book = book_result.scalar_one_or_none()
+        
+        # Get user details
+        user_result = await session.execute(
+            select(User).where(User.id == record.user_id)
+        )
+        user = user_result.scalar_one_or_none()
+        
+        if book and user:
+            days_pending = (datetime.utcnow() - record.borrowed_date).days
+            
+            pending_borrows.append({
+                "borrow_id": record.id,
+                "book_id": book.id,
+                "book_title": book.title,
+                "author": book.author,
+                "isbn": book.isbn,
+                "available_copies": book.available_copies,
+                "user_id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "current_books_borrowed": user.current_books_borrowed,
+                "max_books_allowed": user.max_books_allowed,
+                "borrowed_date": record.borrowed_date,
+                "days_pending": days_pending,
+                "approve_url": f"/admin/borrows/approve",
+                "reject_url": f"/admin/borrows/approve"
+            })
+    
     return {
-        "message": f"Successfully borrowed '{book.title}'",
-        "borrow_id": borrow_record.id,
-        "book_title": book.title,
-        "borrowed_date": borrow_record.borrowed_date,
-        "due_date": borrow_record.due_date,
-        "user_books_borrowed": current_user.current_books_borrowed,
-        "book_available_copies": book.available_copies
+        "pending_count": len(pending_borrows),
+        "checked_at": datetime.utcnow(),
+        "pending_borrows": pending_borrows
+    }
+
+@app.get("/users/me/pending-borrows")
+async def get_my_pending_borrows(
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """Get current user's pending borrow requests"""
+    
+    result = await session.execute(
+        select(BorrowRecord).where(
+            BorrowRecord.user_id == current_user.id,
+            BorrowRecord.status == "pending_approval"
+        ).order_by(BorrowRecord.borrowed_date)
+    )
+    
+    pending_records = result.scalars().all()
+    
+    pending_borrows = []
+    for record in pending_records:
+        # Get book details
+        book_result = await session.execute(
+            select(Book).where(Book.id == record.book_id)
+        )
+        book = book_result.scalar_one_or_none()
+        
+        if book:
+            days_pending = (datetime.utcnow() - record.borrowed_date).days
+            
+            pending_borrows.append({
+                "borrow_id": record.id,
+                "book_id": book.id,
+                "book_title": book.title,
+                "author": book.author,
+                "borrowed_date": record.borrowed_date,
+                "days_pending": days_pending,
+                "status": record.status,
+                "instructions": "Awaiting admin approval. You will be notified when approved."
+            })
+    
+    return {
+        "user_id": current_user.id,
+        "username": current_user.username,
+        "pending_borrows_count": len(pending_borrows),
+        "pending_borrows": pending_borrows
+    }
+
+
+@app.post("/admin/borrow/{borrow_id}/return", response_model=ReturnResponse)
+async def admin_return_book(
+    borrow_id: str,
+    current_user: User = Depends(get_current_admin_user),  # Admin only
+    session: AsyncSession = Depends(get_async_session)
+):
+    """Admin return - can return any book (for librarians)"""
+    
+    # 1. Find the borrow record
+    result = await session.execute(
+        select(BorrowRecord).where(
+            BorrowRecord.id == borrow_id,
+            BorrowRecord.status == "borrowed"
+        )
+    )
+    
+    borrow_record = result.scalar_one_or_none()
+    
+    if not borrow_record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Borrow record not found or already returned"
+        )
+    
+    # 2. Get the book
+    book_result = await session.execute(
+        select(Book).where(Book.id == borrow_record.book_id)
+    )
+    book = book_result.scalar_one_or_none()
+    
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    
+    # 3. Get the user who borrowed it
+    user_result = await session.execute(
+        select(User).where(User.id == borrow_record.user_id)
+    )
+    user = user_result.scalar_one_or_none()
+    
+    # 4. Update borrow record
+    returned_date = datetime.utcnow()
+    borrow_record.returned_date = returned_date
+    borrow_record.status = "returned"
+    
+    # 5. Update book availability
+    book.available_copies += 1
+    if book.available_copies > 0 and book.status == "borrowed":
+        book.status = "available"
+    
+    # 6. Update user's borrowed count (if user exists)
+    if user:
+        user.current_books_borrowed -= 1
+    
+    # 7. Save changes
+    await session.commit()
+    
+    # 8. Log the admin return
+    print(f"Admin {current_user.username} returned book '{book.title}' for user {borrow_record.user_id}")
+    
+    return ReturnResponse(
+        message=f"Admin: Successfully returned '{book.title}'",
+        borrow_id=borrow_record.id,
+        book_title=book.title,
+        book_id=book.id,
+        user_id=borrow_record.user_id,
+        borrowed_date=borrow_record.borrowed_date,
+        returned_date=returned_date,
+        user_books_borrowed=user.current_books_borrowed if user else 0,
+        book_available_copies=book.available_copies
+    )
+
+
+@app.post("/borrow/{borrow_id}/return", response_model=ReturnResponse)
+async def request_return_book(
+    borrow_id: str,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """User requests to return a book (creates pending return request)"""
+    
+    # 1. Find the borrow record - assuming you have a BorrowRecord SQLAlchemy model
+    result = await session.execute(
+        select(BorrowRecord).where(
+            BorrowRecord.id == borrow_id,
+            BorrowRecord.user_id == current_user.id,
+            BorrowRecord.status == "borrowed"
+        )
+    )
+    
+    borrow_record = result.scalar_one_or_none()
+    
+    if not borrow_record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Borrow record not found, already returned, or you don't have permission"
+        )
+    
+    # 2. Get the book
+    book_result = await session.execute(
+        select(Book).where(Book.id == borrow_record.book_id)
+    )
+    book = book_result.scalar_one_or_none()
+    
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found in database")
+    
+    # 3. Update borrow record to pending return status
+    return_requested_date = datetime.utcnow()
+    borrow_record.return_requested_date = return_requested_date
+    borrow_record.status = "pending_return"
+    
+    # Note: Book availability and user count NOT updated yet
+    
+    # 4. Save changes
+    await session.commit()
+    
+    return ReturnResponse(
+        message=f"Return request submitted for '{book.title}'. Please return the physical book to the library for approval.",
+        borrow_id=borrow_record.id,
+        book_title=book.title,
+        book_id=book.id,
+        user_id=current_user.id,
+        borrowed_date=borrow_record.borrowed_date,
+        returned_date=None,
+        return_requested_date=return_requested_date,
+        user_books_borrowed=current_user.current_books_borrowed,
+        book_available_copies=book.available_copies,
+        status="pending_return"
+    )
+
+@app.post("/admin/returns/approve", response_model=ReturnResponse)
+async def admin_approve_return(
+    approve_data: AdminApproveReturn,
+    current_user: User = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """Admin approves or rejects a pending return request"""
+    
+    # 1. Find the borrow record with pending return status
+    result = await session.execute(
+        select(BorrowRecord).where(
+            BorrowRecord.id == approve_data.borrow_id,
+            BorrowRecord.status == "pending_return"
+        )
+    )
+    
+    borrow_record = result.scalar_one_or_none()
+    
+    if not borrow_record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pending return request not found"
+        )
+    
+    # 2. Get the book
+    book_result = await session.execute(
+        select(Book).where(Book.id == borrow_record.book_id)
+    )
+    book = book_result.scalar_one_or_none()
+    
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    
+    # 3. Get the user who borrowed it
+    user_result = await session.execute(
+        select(User).where(User.id == borrow_record.user_id)
+    )
+    user = user_result.scalar_one_or_none()
+    
+    if approve_data.approve:
+        # 4. Update borrow record as returned
+        returned_date = datetime.utcnow()
+        borrow_record.returned_date = returned_date
+        borrow_record.status = "returned"
+        borrow_record.return_approved_by = current_user.id
+        borrow_record.return_notes = approve_data.notes
+        
+        # 5. Update book availability
+        book.available_copies += 1
+        if book.available_copies > 0 and book.status == "borrowed":
+            book.status = "available"
+        
+        # 6. Update user's borrowed count
+        if user:
+            user.current_books_borrowed -= 1
+        
+        message = f"Approved return of '{book.title}'"
+        status_str = "returned"
+    else:
+        # Reject the return request - revert to borrowed status
+        borrow_record.status = "borrowed"
+        borrow_record.return_requested_date = None
+        borrow_record.return_notes = f"Rejected: {approve_data.notes}" if approve_data.notes else "Rejected by admin"
+        
+        message = f"Rejected return request for '{book.title}'"
+        status_str = "borrowed"
+    
+    # 7. Save changes
+    await session.commit()
+    
+    return ReturnResponse(
+        message=message,
+        borrow_id=borrow_record.id,
+        book_title=book.title,
+        book_id=book.id,
+        user_id=borrow_record.user_id,
+        borrowed_date=borrow_record.borrowed_date,
+        returned_date=borrow_record.returned_date if approve_data.approve else None,
+        return_requested_date=borrow_record.return_requested_date,
+        user_books_borrowed=user.current_books_borrowed if user else 0,
+        book_available_copies=book.available_copies,
+        status=status_str
+    )
+
+@app.get("/admin/returns/pending", response_model=dict)
+async def get_pending_returns(
+    current_user: User = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """Get all pending return requests (Admin only)"""
+    
+    result = await session.execute(
+        select(BorrowRecord).where(
+            BorrowRecord.status == "pending_return"
+        ).order_by(BorrowRecord.return_requested_date)
+    )
+    
+    pending_records = result.scalars().all()
+    
+    pending_returns = []
+    for record in pending_records:
+        # Get book details
+        book_result = await session.execute(
+            select(Book).where(Book.id == record.book_id)
+        )
+        book = book_result.scalar_one_or_none()
+        
+        # Get user details
+        user_result = await session.execute(
+            select(User).where(User.id == record.user_id)
+        )
+        user = user_result.scalar_one_or_none()
+        
+        if book and user:
+            days_pending = (datetime.utcnow() - record.return_requested_date).days if record.return_requested_date else 0
+            days_borrowed = (datetime.utcnow() - record.borrowed_date).days
+            
+            pending_returns.append({
+                "borrow_id": record.id,
+                "book_id": book.id,
+                "book_title": book.title,
+                "author": book.author,
+                "user_id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "borrowed_date": record.borrowed_date,
+                "due_date": record.due_date,
+                "return_requested_date": record.return_requested_date,
+                "days_pending": days_pending,
+                "days_borrowed": days_borrowed,
+                "renewal_count": record.renewal_count
+            })
+    
+    return {
+        "pending_count": len(pending_returns),
+        "checked_at": datetime.utcnow(),
+        "pending_returns": pending_returns
+    }
+
+@app.get("/users/me/pending-returns", response_model=dict)
+async def get_my_pending_returns(
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """Get current user's pending return requests"""
+    
+    result = await session.execute(
+        select(BorrowRecord).where(
+            BorrowRecord.user_id == current_user.id,
+            BorrowRecord.status == "pending_return"
+        ).order_by(BorrowRecord.return_requested_date)
+    )
+    
+    pending_records = result.scalars().all()
+    
+    pending_returns = []
+    for record in pending_records:
+        # Get book details
+        book_result = await session.execute(
+            select(Book).where(Book.id == record.book_id)
+        )
+        book = book_result.scalar_one_or_none()
+        
+        if book:
+            days_pending = (datetime.utcnow() - record.return_requested_date).days if record.return_requested_date else 0
+            
+            pending_returns.append({
+                "borrow_id": record.id,
+                "book_id": book.id,
+                "book_title": book.title,
+                "author": book.author,
+                "borrowed_date": record.borrowed_date,
+                "return_requested_date": record.return_requested_date,
+                "days_pending": days_pending,
+                "status": "pending_return",
+                "instructions": "Please bring the physical book to the library for approval"
+            })
+    
+    return {
+        "user_id": current_user.id,
+        "username": current_user.username,
+        "pending_returns_count": len(pending_returns),
+        "pending_returns": pending_returns
+    }
+
+@app.get("/users/me/current-borrows")
+async def get_my_current_borrows(
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """Get current user's APPROVED borrowed books (not pending)"""
+    
+    result = await session.execute(
+        select(BorrowRecord).where(
+            BorrowRecord.user_id == current_user.id,
+            BorrowRecord.status == "borrowed"  # Only approved/borrowed books
+        ).order_by(BorrowRecord.due_date)
+    )
+    
+    borrow_records = result.scalars().all()
+    
+    current_borrows = []
+    for record in borrow_records:
+        # Get book details
+        book_result = await session.execute(
+            select(Book).where(Book.id == record.book_id)
+        )
+        book = book_result.scalar_one_or_none()
+        
+        if book:
+            # Check if overdue
+            is_overdue = datetime.utcnow() > record.due_date
+            days_overdue = (datetime.utcnow() - record.due_date).days if is_overdue else 0
+            
+            current_borrows.append({
+                "borrow_id": record.id,
+                "book_id": book.id,
+                "book_title": book.title,
+                "author": book.author,
+                "borrowed_date": record.borrowed_date,
+                "due_date": record.due_date,
+                "approved_by": record.approved_by,
+                "approval_date": record.approval_date,
+                "days_borrowed": (datetime.utcnow() - record.borrowed_date).days,
+                "is_overdue": is_overdue,
+                "days_overdue": days_overdue,
+                "renewal_count": record.renewal_count,
+                "max_renewals": record.max_renewals,
+                "can_renew": record.renewal_count < record.max_renewals,
+                "status": record.status
+            })
+    
+    return {
+        "user_id": current_user.id,
+        "username": current_user.username,
+        "current_borrows_count": len(current_borrows),
+        "max_books_allowed": current_user.max_books_allowed,
+        "available_slots": current_user.max_books_allowed - current_user.current_books_borrowed,
+        "current_borrows": current_borrows
+    }
+
+
+@app.get("/users/me/all-borrow-requests")
+async def get_my_all_borrow_requests(
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """Get all borrow requests (pending, approved, rejected) for current user"""
+    
+    result = await session.execute(
+        select(BorrowRecord).where(
+            BorrowRecord.user_id == current_user.id
+        ).order_by(BorrowRecord.borrowed_date.desc())
+    )
+    
+    all_records = result.scalars().all()
+    
+    all_requests = []
+    for record in all_records:
+        # Get book details
+        book_result = await session.execute(
+            select(Book).where(Book.id == record.book_id)
+        )
+        book = book_result.scalar_one_or_none()
+        
+        if book:
+            request_info = {
+                "borrow_id": record.id,
+                "book_id": book.id,
+                "book_title": book.title,
+                "author": book.author,
+                "status": record.status,
+                "borrowed_date": record.borrowed_date,
+                "due_date": record.due_date,
+                "approved_by": record.approved_by,
+                "approval_date": record.approval_date,
+                "approval_notes": record.approval_notes,
+                "returned_date": record.returned_date
+            }
+            
+            # Add status-specific information
+            if record.status == "pending_approval":
+                request_info["message"] = "Awaiting admin approval"
+                request_info["can_cancel"] = True
+            elif record.status == "borrowed":
+                request_info["message"] = "Approved - Book is with you"
+                request_info["can_return"] = True
+            elif record.status == "rejected":
+                request_info["message"] = "Request was rejected"
+                request_info["can_retry"] = True
+            elif record.status == "returned":
+                request_info["message"] = "Book returned"
+            
+            all_requests.append(request_info)
+    
+    return {
+        "user_id": current_user.id,
+        "username": current_user.username,
+        "total_requests": len(all_requests),
+        "requests": all_requests
+    }
+
+
+
+@app.delete("/borrow/{borrow_id}/cancel")
+async def cancel_pending_borrow(
+    borrow_id: str,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """Cancel a pending borrow request"""
+    
+    result = await session.execute(
+        select(BorrowRecord).where(
+            BorrowRecord.id == borrow_id,
+            BorrowRecord.user_id == current_user.id,
+            BorrowRecord.status == "pending_approval"
+        )
+    )
+    
+    borrow_record = result.scalar_one_or_none()
+    
+    if not borrow_record:
+        raise HTTPException(
+            status_code=404,
+            detail="Pending borrow request not found or cannot be canceled"
+        )
+    
+    # Delete the pending request
+    await session.delete(borrow_record)
+    await session.commit()
+    
+    return {
+        "message": "Borrow request canceled successfully",
+        "borrow_id": borrow_id
+    }
+
+
+@app.get("/admin/overdue-books")
+async def get_overdue_books(
+    current_user: User = Depends(get_current_admin_user),
+    session: AsyncSession = Depends(get_async_session)
+):
+    """Get all overdue books (Admin only) - Include pending returns"""
+    
+    result = await session.execute(
+        select(BorrowRecord).where(
+            BorrowRecord.status.in_(["borrowed", "pending_return"]),
+            BorrowRecord.due_date < datetime.utcnow()
+        ).order_by(BorrowRecord.due_date)
+    )
+    
+    overdue_records = result.scalars().all()
+    
+    overdue_books = []
+    for record in overdue_records:
+        # Get book details
+        book_result = await session.execute(
+            select(Book).where(Book.id == record.book_id)
+        )
+        book = book_result.scalar_one_or_none()
+        
+        # Get user details
+        user_result = await session.execute(
+            select(User).where(User.id == record.user_id)
+        )
+        user = user_result.scalar_one_or_none()
+        
+        if book and user:
+            days_overdue = (datetime.utcnow() - record.due_date).days
+            
+            overdue_books.append({
+                "borrow_id": record.id,
+                "book_id": book.id,
+                "book_title": book.title,
+                "author": book.author,
+                "user_id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "borrowed_date": record.borrowed_date,
+                "due_date": record.due_date,
+                "days_overdue": days_overdue,
+                "renewal_count": record.renewal_count,
+                "status": record.status,
+                "return_requested_date": record.return_requested_date if record.status == "pending_return" else None,
+                "admin_action_url": f"/admin/returns/approve"
+            })
+    
+    return {
+        "overdue_count": len(overdue_books),
+        "checked_at": datetime.utcnow(),
+        "overdue_books": overdue_books
     }
